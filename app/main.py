@@ -113,6 +113,31 @@ class CommitResponse(BaseModel):
     free_cidrs: list[str]
 
 
+class ReclaimRequest(BaseModel):
+    pool_version: int = Field(..., ge=1, description="读取到的池版本号。")
+    cidr: str = Field(
+        ...,
+        description=(
+            "待部分回收的规范 CIDR（主机位必须为零）。该区间必须完全由"
+            "当前已分配地址覆盖，可跨越相邻的多条分配记录。"
+        ),
+    )
+
+    @field_validator("cidr")
+    @classmethod
+    def _validate_cidr(cls, raw: str) -> str:
+        # strict=True：主机位非零的非对齐写法直接报错。
+        return str(ipaddress.ip_network(raw, strict=True))
+
+
+class ReclaimResponse(BaseModel):
+    status: Literal["reclaimed"]
+    pool_version: int
+    reclaimed_cidrs: list[str]
+    allocated_cidrs: list[str]
+    free_cidrs: list[str]
+
+
 # ---------------------------------------------------------------------------
 # 辅助
 # ---------------------------------------------------------------------------
@@ -200,5 +225,34 @@ def commit(
         status="committed",
         pool_version=state.version,
         allocations=[str(n) for n in networks],
+        free_cidrs=[str(n) for n in free],
+    )
+
+
+@app.post(
+    "/api/allocations/reclaim",
+    response_model=ReclaimResponse,
+    tags=["allocations"],
+)
+def reclaim(
+    body: ReclaimRequest, db: Database = Depends(get_db)
+) -> ReclaimResponse:
+    """部分回收：从已分配地址中扣除一个规范 CIDR，原子改写并自增版本。
+
+    目标 CIDR 必须完全被当前已分配地址覆盖（可跨越多条相邻分配记录）；
+    若含未分配或保留地址、越出父网段或版本过期，返回 409 且地址池不变。
+    回收后池状态查询与后续分配预演立即反映释放出的空间。
+    """
+    target = ipaddress.ip_network(body.cidr, strict=True)
+    try:
+        state = db.reclaim_allocation(body.pool_version, target)
+    except ConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    free, _ = _free_cidrs(state)
+    return ReclaimResponse(
+        status="reclaimed",
+        pool_version=state.version,
+        reclaimed_cidrs=[str(target)],
+        allocated_cidrs=[str(n) for n in state.allocated],
         free_cidrs=[str(n) for n in free],
     )

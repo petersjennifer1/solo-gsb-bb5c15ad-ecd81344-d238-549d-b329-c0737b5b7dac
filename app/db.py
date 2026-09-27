@@ -11,15 +11,21 @@
   复检 + 插入 + 版本自增”，任何一步失败即整体回滚，绝不部分分配；
   提交响应使用的版本与分配结果同样取自该写事务内部，不会混入其它
   并发提交之后的状态。
+* 部分回收接口在单条 ``BEGIN IMMEDIATE`` 事务内完成“版本检查 + 覆盖性
+  复检 + 已分配集合按区间扣除重写 + 版本自增”：目标 CIDR 必须完全由
+  已分配地址覆盖，仍被占用的地址整体重写为最少的规范 CIDR；任何一步
+  失败即整体回滚，地址池与版本保持原样。
 """
 from __future__ import annotations
 
+import bisect
 import ipaddress
 import sqlite3
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 
+from .allocator import _collapse_ranges, _network_bounds, _ranges_to_cidrs
 from .config import Settings
 
 _SCHEMA = """
@@ -238,9 +244,155 @@ class Database:
                 raise ConflictError(f"commit failed: {exc}") from exc
         return state
 
+    # -- 部分回收 ----------------------------------------------------------
+
+    def reclaim_allocation(
+        self,
+        expected_version: int,
+        target: ipaddress._BaseNetwork,
+    ) -> PoolState:
+        """部分回收：从已分配地址中扣除 *target*，原子改写并自增版本。
+
+        *target* 必须完全由当前已分配地址覆盖（可跨越多条相邻分配记录），
+        不得包含保留或未分配地址，不得越出父网段，且池版本须与
+        *expected_version* 一致。任一条件不满足抛 ConflictError，地址池
+        不发生任何改动。
+
+        成功时在**单条 BEGIN IMMEDIATE 写事务**内：
+        1. 用整数区间合并全部已分配子网，从中扣除目标区间；
+        2. 仍被占用的区间整体重写为数量最少的规范 CIDR（相邻碎片合并）；
+        3. 版本自增，并在同一事务内读取返回状态。
+        """
+        width = target.max_prefixlen
+        t_start, t_end = _network_bounds(target)
+
+        with self._conn() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT parent_cidr, version FROM pool_meta WHERE id = 1"
+                ).fetchone()
+                current_version = row["version"]
+                if current_version != expected_version:
+                    conn.rollback()
+                    raise ConflictError(
+                        f"pool version changed: expected {expected_version}, "
+                        f"current {current_version}"
+                    )
+
+                parent = ipaddress.ip_network(row["parent_cidr"], strict=True)
+                if target.version != parent.version or not target.subnet_of(parent):
+                    conn.rollback()
+                    raise ConflictError(
+                        f"reclaim target {target} is outside of pool {parent}"
+                    )
+
+                rows = conn.execute(
+                    "SELECT cidr, kind FROM subnets"
+                ).fetchall()
+                allocated_nets = [
+                    ipaddress.ip_network(r["cidr"], strict=True)
+                    for r in rows
+                    if r["kind"] == "allocated"
+                ]
+                reserved_ranges = _collapse_ranges(
+                    [
+                        _network_bounds(ipaddress.ip_network(r["cidr"], strict=True))
+                        for r in rows
+                        if r["kind"] == "reserved"
+                    ]
+                )
+
+                # 目标区间不得触碰任何保留地址。
+                for r_start, r_end in reserved_ranges:
+                    if r_start <= t_end and t_start <= r_end:
+                        conn.rollback()
+                        raise ConflictError(
+                            f"reclaim target {target} contains or overlaps a "
+                            f"reserved address"
+                        )
+
+                alloc_ranges = _collapse_ranges(
+                    [_network_bounds(net) for net in allocated_nets]
+                )
+                if not _covered_by(t_start, t_end, alloc_ranges):
+                    conn.rollback()
+                    raise ConflictError(
+                        f"reclaim target {target} is not fully covered by "
+                        f"allocated addresses (contains unallocated space)"
+                    )
+
+                # 从已分配占用区间中扣除目标区间，剩余区间合并相邻段后
+                # 规范化为数量最少的规范 CIDR（全局重写，消除碎片）。
+                remaining_ranges = _collapse_ranges(
+                    _subtract_ranges_for_reclaim(alloc_ranges, (t_start, t_end))
+                )
+                new_alloc_nets = [
+                    ipaddress.ip_network((s, p), strict=True)
+                    for s, p in _ranges_to_cidrs(width, remaining_ranges)
+                ]
+
+                # 单写事务内整体重写“已分配”集合：扣除目标地址后，仍被
+                # 占用的全部地址以最少的规范 CIDR 重新落库（相邻碎片合并）。
+                conn.execute(
+                    "DELETE FROM subnets WHERE kind = 'allocated'"
+                )
+                conn.executemany(
+                    "INSERT INTO subnets (cidr, kind) VALUES (?, 'allocated')",
+                    [(str(net),) for net in new_alloc_nets],
+                )
+                conn.execute(
+                    "UPDATE pool_meta SET version = version + 1 WHERE id = 1"
+                )
+                state = self._load_state(conn)
+                conn.commit()
+                self._after_commit(conn)
+            except ConflictError:
+                raise
+            except sqlite3.Error as exc:
+                conn.rollback()
+                raise ConflictError(f"reclaim failed: {exc}") from exc
+
+        return state
+
+
+def _subtract_ranges_for_reclaim(
+    cover: list[tuple[int, int]], hole: tuple[int, int]
+) -> list[tuple[int, int]]:
+    """从合并后的占用区间集合 cover 中扣除单个区间 hole。"""
+    h_start, h_end = hole
+    result: list[tuple[int, int]] = []
+    for start, end in cover:
+        if h_end < start or h_start > end:
+            result.append((start, end))
+            continue
+        if start < h_start:
+            result.append((start, min(end, h_start - 1)))
+        if end > h_end:
+            result.append((max(start, h_end + 1), end))
+    return result
+
 
 def _assert_disjoint(networks: tuple[ipaddress._BaseNetwork, ...]) -> None:
     ordered = sorted(networks, key=lambda n: int(n.network_address))
     for a, b in zip(ordered, ordered[1:]):
         if a.overlaps(b):
             raise ConflictError(f"plan contains overlapping subnets {a}, {b}")
+
+
+def _covered_by(
+    start: int, end: int, ranges: list[tuple[int, int]]
+) -> bool:
+    """整数区间 [start, end] 是否完全被合并后的（不相交有序）区间集合覆盖。"""
+    cursor = start
+    # 起点 <= cursor 的最后一个区间是唯一可能覆盖 cursor 的候选。
+    idx = bisect.bisect_right(ranges, (cursor, 1 << 128)) - 1
+    while cursor <= end:
+        if idx < 0 or idx >= len(ranges):
+            return False
+        r_start, r_end = ranges[idx]
+        if r_start > cursor or r_end < cursor:
+            return False
+        cursor = r_end + 1
+        idx += 1
+    return True
