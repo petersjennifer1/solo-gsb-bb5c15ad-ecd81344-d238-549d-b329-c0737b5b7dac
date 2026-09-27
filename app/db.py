@@ -20,6 +20,12 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 
+from .allocator import (
+    _collapse_ranges,
+    _network_bounds,
+    _ranges_to_cidrs,
+    _subtract_ranges,
+)
 from .config import Settings
 
 _SCHEMA = """
@@ -237,6 +243,124 @@ class Database:
                 conn.rollback()
                 raise ConflictError(f"commit failed: {exc}") from exc
         return state
+
+    # -- 已分配地址的部分回收 ---------------------------------------------
+
+    def reclaim_allocated(
+        self,
+        expected_version: int,
+        target: ipaddress._BaseNetwork,
+    ) -> tuple[PoolState, tuple[ipaddress._BaseNetwork, ...]]:
+        """回收一个**完全由当前已分配地址覆盖**的规范 CIDR。
+
+        目标 CIDR 可跨越相邻的多条分配记录。在单条 ``BEGIN IMMEDIATE``
+        事务内完成版本检查、覆盖性复检、扣除、重写与版本自增：任何一步
+        失败（版本过期 / 越出父网段 / 含保留或未分配地址）即整体回滚，
+        地址池不发生任何改动。
+
+        扣除后把全部仍被占用的地址（全局合并相邻区间）重写为**最少**的
+        规范 CIDR 再落库。返回写事务内读取的新状态与重写后的已分配
+        CIDR 序列。
+        """
+        with self._conn() as conn:
+            try:
+                # 立即获取写锁，与并发提交/回收互斥。
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT parent_cidr, version FROM pool_meta WHERE id = 1"
+                ).fetchone()
+                current_version = row["version"]
+                if current_version != expected_version:
+                    conn.rollback()
+                    raise ConflictError(
+                        f"pool version changed: expected {expected_version}, "
+                        f"current {current_version}"
+                    )
+
+                parent = ipaddress.ip_network(row["parent_cidr"], strict=True)
+                if target.version != parent.version or not target.subnet_of(
+                    parent
+                ):
+                    conn.rollback()
+                    raise ConflictError(
+                        f"reclaim target {target} is outside of pool {parent}"
+                    )
+
+                rows = conn.execute(
+                    "SELECT cidr, kind FROM subnets"
+                ).fetchall()
+                reserved = [
+                    ipaddress.ip_network(r["cidr"], strict=True)
+                    for r in rows
+                    if r["kind"] == "reserved"
+                ]
+                allocated = [
+                    ipaddress.ip_network(r["cidr"], strict=True)
+                    for r in rows
+                    if r["kind"] == "allocated"
+                ]
+
+                if any(target.overlaps(net) for net in reserved):
+                    conn.rollback()
+                    raise ConflictError(
+                        f"reclaim target {target} contains reserved address"
+                    )
+
+                target_range = _network_bounds(target)
+                allocated_ranges = _collapse_ranges(
+                    [_network_bounds(net) for net in allocated]
+                )
+                # 目标区间必须被已分配区间完整覆盖：目标区间减去已分配
+                # 合并集后必须为空（不允许含未分配地址）。
+                uncovered = _subtract_ranges(target_range, allocated_ranges)
+                if uncovered:
+                    conn.rollback()
+                    raise ConflictError(
+                        f"reclaim target {target} is not fully covered by "
+                        f"allocated addresses"
+                    )
+
+                # 从已分配合并区间中扣除目标区间；_ranges_to_cidrs 对每个
+                # 连续区间贪心切出最大对齐块，块数即该区间的最少规范 CIDR
+                # 数量；先 _collapse_ranges 合并扣除后再次相邻的区间。
+                leftover_ranges: list[tuple[int, int]] = []
+                t_start, t_end = target_range
+                for a_start, a_end in allocated_ranges:
+                    if a_end < t_start or a_start > t_end:
+                        leftover_ranges.append((a_start, a_end))
+                        continue
+                    if a_start < t_start:
+                        leftover_ranges.append((a_start, t_start - 1))
+                    if a_end > t_end:
+                        leftover_ranges.append((t_end + 1, a_end))
+                leftover_ranges = _collapse_ranges(leftover_ranges)
+                new_allocated = [
+                    ipaddress.ip_network((s, p), strict=True)
+                    for s, p in _ranges_to_cidrs(
+                        target.max_prefixlen, leftover_ranges
+                    )
+                ]
+
+                # 重写已分配子网：删除全部 allocated 行后写回规范化结果。
+                conn.execute("DELETE FROM subnets WHERE kind = 'allocated'")
+                conn.executemany(
+                    "INSERT INTO subnets (cidr, kind) "
+                    "VALUES (?, 'allocated')",
+                    [(str(net),) for net in new_allocated],
+                )
+                conn.execute(
+                    "UPDATE pool_meta SET version = version + 1 WHERE id = 1"
+                )
+                # 与提交相同：在同一写事务内读取回收后的状态。
+                state = self._load_state(conn)
+                conn.commit()
+                self._after_commit(conn)
+            except ConflictError:
+                raise
+            except sqlite3.Error as exc:
+                conn.rollback()
+                raise ConflictError(f"reclaim failed: {exc}") from exc
+        return state, tuple(state.allocated)
 
 
 def _assert_disjoint(networks: tuple[ipaddress._BaseNetwork, ...]) -> None:

@@ -9,6 +9,8 @@
 
 提交接口只在**池版本未变化且方案仍可用**时，在单条数据库事务内**原子落库**；否则返回 `409 Conflict`，**不会发生部分分配**。
 
+回收接口对**已分配地址做部分回收**：传入池版本与一个规范 CIDR，该 CIDR 必须**完全由当前已分配地址覆盖**（可跨越相邻的多条分配记录）；在单条写事务内扣除目标地址、把仍被占用的部分重写为最少的规范 CIDR 并自增版本。若含未分配或保留地址、越出父网段或版本过期，则返回 `409 Conflict` 且**地址池保持不变**。
+
 ---
 
 ## 一条命令启动
@@ -67,6 +69,7 @@ docker compose down -v         # 同时删除数据卷（彻底重置）
 | GET | `/api/pool` | 查询池状态：父网段、版本、保留/已分配子网、当前空闲 CIDR |
 | POST | `/api/allocations/preview` | **预演**：不修改状态，返回池版本与最优方案 |
 | POST | `/api/allocations/commit` | **提交**：携带版本与方案，原子落库或返回 409 |
+| POST | `/api/allocations/reclaim` | **部分回收**：回收完全被已分配地址覆盖的规范 CIDR |
 
 ### 1. 查询池状态
 
@@ -152,6 +155,46 @@ curl -X POST http://localhost:8000/api/allocations/commit \
 
 典型工作流：**先 preview 拿到 `pool_version` + `allocations`，再原样 commit**；若收到 409，则重新 preview 后重试。
 
+### 4. 回收已分配地址（部分回收，原子）
+
+把当前池版本与一个**规范 CIDR** 提交到回收接口。该 CIDR 必须**完全由当前已分配地址覆盖**——可以恰好是一条分配记录，也可以跨越相邻的多条记录（例如两个相邻 `/25` 合成的 `/24`），也可以只覆盖某条记录的一部分。
+
+```bash
+curl -X POST http://localhost:8000/api/allocations/reclaim \
+  -H 'Content-Type: application/json' \
+  -d '{"pool_version": 3, "cidr": "10.1.0.128/25"}'
+```
+
+成功（在单个 SQLite 写事务内扣除目标地址、剩余占用重写为最少规范 CIDR、版本自增）：
+
+```json
+{
+  "status": "reclaimed",
+  "pool_version": 4,
+  "reclaimed_cidr": "10.1.0.128/25",
+  "allocated_cidrs": ["10.1.1.0/24"],
+  "free_cidrs": ["..."]
+}
+```
+
+- `reclaimed_cidr`：实际回收的 CIDR（即请求的规范 CIDR）；
+- `allocated_cidrs`：回收后**剩余仍被占用**的地址，已全局合并相邻区间并重写为**数量最少**的规范 CIDR（可能少于原分配记录数）；
+- `free_cidrs`：回收后的当前空闲 CIDR，回收空间立即可用；
+- `pool_version`：自增后的新版本，后续预演/提交/回收均以此为准。
+
+成功回收后，**池状态查询（`GET /api/pool`）与后续分配预演立即反映回收空间**：同一 CIDR 可立刻被 `/api/allocations/preview` 选中并再次提交。
+
+失败时返回 `409 Conflict`，响应体 `detail` 说明原因，**数据库不发生任何写入（版本与地址池均不变）**：
+
+- `pool_version` 已过期（被其它提交/回收改变，乐观并发控制）；
+- CIDR 越出父网段；
+- CIDR 与保留子网重叠（含保留地址）；
+- CIDR 未被已分配地址完全覆盖（含未分配地址），包括已分配集为空时的回收。
+
+CIDR 写法非规范（如主机位非零的 `10.1.0.1/24` 或无法解析）返回 `422 Unprocessable Entity`。
+
+> 回收不要求目标与既有分配记录的边界对齐，但目标本身必须是规范 CIDR；扣除后系统会重新规范化全部已分配地址，因此回收后 `allocated_cidrs` 里的记录集合可能与回收前完全不同（数目通常更少），其覆盖的地址集合则严格等于“原已分配集合减去目标”。
+
 ---
 
 ## 正确性与并发保证
@@ -171,6 +214,12 @@ curl -X POST http://localhost:8000/api/allocations/commit \
   严格绑定本次提交；不会在提交后另开连接而混入其它并发提交的结果。
   （`tests/test_concurrency.py` 用可控的并发交错对以上两条读取不变量
   做了回归覆盖。）
+- 回收接口同样使用 `BEGIN IMMEDIATE` 单事务：版本检查 → 父网段/保留地址
+  /覆盖性复检 → 删除并以最少规范 CIDR 重写已分配集 → 版本自增。任一环节
+  失败立即回滚，地址池不发生任何改动；回收与并发提交/回收之间由写锁互斥，
+  同一版本并发写时**恰有一个**成功。回收响应中的已分配/空闲 CIDR 同样在
+  本写事务内部读取，提交后的 `GET /api/pool` 与预演立即基于新版本与回收后
+  的占用集计算。
 
 ---
 
@@ -187,6 +236,7 @@ DB_PATH=./cidr_pool.db PARENT_CIDR=10.0.0.0/16 \
 ```bash
 python3 -m tests.test_allocator_bruteforce   # 4000 组 IPv4 暴力对照
 python3 -m tests.test_api                    # 接口端到端 + 冲突/原子性
+python3 -m tests.test_reclaim                # 部分回收端到端：跨记录/重写/冲突
 python3 -m tests.test_concurrency            # 并发交错回归：快照读取与提交响应绑定
 ```
 
@@ -202,6 +252,7 @@ tests/
   test_allocator_bruteforce.py
   test_dense_reserved.py
   test_api.py
+  test_reclaim.py
   test_concurrency.py
 Dockerfile
 docker-compose.yml
